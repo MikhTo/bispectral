@@ -1,3 +1,5 @@
+from unittest import case
+
 import numpy as np
 import scipy.fft
 import matplotlib.pyplot as plt
@@ -6,7 +8,13 @@ from enum import StrEnum, auto
 
 class Region(StrEnum):
     A = auto()
+    B = auto()
     AB = auto() 
+
+class bi_mode(StrEnum):
+    auto_mode = auto()
+    double_cross_mode = auto()
+    triple_cross_mode = auto()
 
 def _get_sampled(signal, nperseg, noverlap):
     step = nperseg - noverlap
@@ -22,14 +30,23 @@ def _get_bicspec_grids(n, region:Region = Region.AB):
 
     half = n - 1                      
     x_freq = np.arange(0, half + 1)
-    y_freq = np.arange(-half if region is Region.AB else 0,
-                                            half // 2 + 1)
+    match region:
+        case Region.A:
+            y_freq = np.arange(0, half // 2 + 1)
+        case Region.B:
+            y_freq = np.arange(-half, 0)
+        case Region.AB:
+            y_freq = np.arange(-half, half // 2 + 1)
     
     X, Y = np.meshgrid(x_freq, y_freq, indexing='ij')
 
-    mask = (Y >= 0) & (Y <= X) & (Y + X <= half) # sum freqs area (region A)
-    if region is Region.AB:
-        mask |= (Y <= -1) & (Y >= -X) # diff freqs area (region B)    
+    match region:
+        case Region.A:
+            mask = (Y >= 0) & (Y <= X) & (X + Y <= half)
+        case Region.B:
+            mask = (Y < 0) & (-Y <= X)
+        case Region.AB:
+            mask = (Y >= 0) & (Y <= X) & (X + Y <= half) | (Y < 0) & (-Y <= X)
              
     return X, Y, mask
 
@@ -46,8 +63,9 @@ def _calculate_valid_bispectrum(signal, fs, nperseg, noverlap=0, region:Region =
     # Fourier amplitudes for pairs of interset. Result shape (nwin, P)
     Xx = FT[:, Xv] 
     Xy = FT[:, np.abs(Yv)]
-    if region is Region.AB:
-        Xy[:, Yv < 0] = np.conj(Xy[:, Yv < 0])               # X(-m) = conj(X(m)) for diff couple
+    
+    Xy[:, Yv < 0] = np.conj(Xy[:, Yv < 0])               # X(-m) = conj(X(m)) for diff couple
+    
     Xxy = FT[:, Xv + Yv]                                 # j+k >= 0 
     
     #squared bicoherence b^2 = |<B>|^2 / (<|Xj Xk|^2> * <|Xjk|^2>)
@@ -65,7 +83,10 @@ def bispectral(signal, fs, nperseg, noverlap=0, region:Region=Region.AB):
 
     half = nperseg // 2
     # упаковка в 2D-массив (j, k) для графика; вне A∪B — NaN
-    yaxis = np.arange(-half if region is Region.AB else 0, half // 2 + 1)
+    match region:
+        case Region.A:  yaxis = np.arange(0, half // 2 + 1)
+        case Region.B:  yaxis = np.arange(-half, 0)
+        case Region.AB: yaxis = np.arange(-half, half // 2 + 1)
 
     mat = np.full((half + 1, yaxis.size), np.nan)
     mat[Xv, Yv - yaxis[0]] = b2
@@ -78,7 +99,19 @@ def bispectral(signal, fs, nperseg, noverlap=0, region:Region=Region.AB):
     freq_y = yaxis * df
     return freq_x, freq_y, mat, bs
 
-def bicoh_summed(signal, fs, nperseg, noverlap=0, region = Region.AB):
+def surrogate_summed(signal, fs, nperseg, noverlap, n_surr=160, region=Region.AB):
+    fur = np.abs(np.fft.fft(signal)); N = signal.size; h = N // 2
+    sums = []
+    for _ in range(n_surr):
+        ph = np.zeros(N); rnd = np.random.uniform(0, 2*np.pi, h)
+        ph[1:h] = rnd[1:h]; ph[h+1:] = -rnd[1:h][::-1]
+        s = np.fft.ifft(fur * np.exp(1j*ph)).real
+        b2s, _, Xs, Ys = _calculate_valid_bispectrum(s, fs, nperseg, noverlap, region)
+        M = Xs + Ys
+        sums.append(np.bincount(M, b2s) / np.bincount(M))
+    return np.percentile(np.array(sums), 97.5, axis=0)
+
+def bicoh_summed(signal, fs, nperseg, noverlap=0, region = Region.AB , threshold = None) -> tuple[np.ndarray, np.ndarray]:
     b2, _, Xv, Yv = _calculate_valid_bispectrum(signal, fs, nperseg, noverlap, region)
 
     M = Xv + Yv
@@ -86,9 +119,13 @@ def bicoh_summed(signal, fs, nperseg, noverlap=0, region = Region.AB):
     count = np.bincount(M)
     b2_sum /= count
 
+    if threshold is not None:
+        b2_sum_thresholded = surrogate_summed(signal, fs, nperseg, noverlap, n_surr=160, region=region)
+        
+
     df = fs / nperseg
-    freq_m   = np.arange(1, len(b2_sum)) * df
-    return freq_m, b2_sum
+    freq_m   = np.arange(len(b2_sum)) * df
+    return freq_m, b2_sum, b2_sum_thresholded if threshold is not None else None
 
 def plot_bicoherence(freq_j, freq_k, mat, 
                      mask=None, title="", c_map = "inferno_r"):
@@ -114,8 +151,7 @@ def plot_bicoherence(freq_j, freq_k, mat,
     ax.set_aspect('equal')
     plt.show()
 
-def bicoh_slice(signal, fs, foi, nperseg, noverlap=0):
-    freq_x, freq_y, b2, _ = bispectral(signal, fs, nperseg, noverlap)
+def bicoh_slice(freq_x, b2, foi):
     
     df = freq_x[1] - freq_x[0]
     half = len(freq_x) - 1
@@ -127,12 +163,11 @@ def bicoh_slice(signal, fs, foi, nperseg, noverlap=0):
     neg_sum = b2[m0:, half-m0]
     low_sum = b2[m0, half - m0 + 1 : half + m0]
     high_sum = b2[m0 : half-m0+1, half + m0]
-    plt.figure()
-    plt.plot(freq_slice, np.hstack((neg_sum[::-1], low_sum, high_sum)))
-    plt.show()
+
+    return freq_slice, np.hstack((neg_sum[::-1], low_sum, high_sum))
 
 
-def surrogate_test(signal: np.ndarray, fs: float, nperseg: int, noverlap: int = 0, n_surrogates: int = 100) -> np.ndarray:
+def surrogate_test(signal: np.ndarray, fs: float, nperseg: int, noverlap: int = 0, n_surrogates: int = 100, region: Region = Region.AB) -> np.ndarray:
     """
     Generate surrogate data and compute significance threshold (95th percentile).
     """
@@ -147,7 +182,7 @@ def surrogate_test(signal: np.ndarray, fs: float, nperseg: int, noverlap: int = 
         phases[1:half] = rnd[1:half]
         phases[half + 1:] = -rnd[1:half][::-1] 
         surrogate = np.fft.ifft(fur_ampl * np.exp(1j * phases)).real
-        _, _, bicoh, _= bispectral(surrogate, fs, nperseg, noverlap)
+        _, _, bicoh, _= bispectral(surrogate, fs, nperseg, noverlap, region=region)
         surrogate_bicoh.append(bicoh)
     
     return np.percentile(np.array(surrogate_bicoh), 97.5, axis=0)
@@ -158,23 +193,52 @@ if __name__ == "__main__":
     sig = data["sig"]
     fs = 1 / (t[1] - t[0])
 
+    if True:
+        #bicoh_slice(sig, fs, 20, int(0.5*fs))
+        freqx, freqy, bicoh, bispec = bispectral(sig, fs, int(1*fs), region=Region.AB, noverlap=int(0.5*fs))# было 5 мс
+        threshold = surrogate_test(sig, fs, int(1*fs), n_surrogates=10, noverlap=int(0.5*fs), region=Region.AB)
+        #np.savez("result_data.npz", freqx=freqx, freqy=freqy, bicoh=bicoh, bispec=bispec, threshold=threshold)
+    else:
+        data = np.load("result_data.npz")
+        freqx = data["freqx"]
+        freqy = data["freqy"]
+        bicoh = data["bicoh"]
+        bispec = data["bispec"]
+        threshold = data["threshold"]
 
-    #bicoh_slice(sig, fs, 20, int(0.5*fs))
-    freqx, freqy, bicoh, bispec = bispectral(sig, fs, int(1*fs), region=Region.AB, noverlap=int(0*fs))# было 5 мс
-    threshold = surrogate_test(sig, fs, int(1*fs), n_surrogates=150, noverlap=int(0*fs))
+    if True:
+        mask = (bicoh > threshold)
+        plot_bicoherence(freqx, freqy, bicoh, mask)
+        plot_bicoherence(freqx, freqy, np.angle(bispec, deg=True), None,
+                        c_map="twilight_shifted")
+        #plot_bicoherence(freqx, freqy, None)
+        #plot_bicoherence(freqx, freqy, np.imag(bispec))
+        #plot_bicoherence(threshold, freq)
 
-    mask = (bicoh > threshold)
-    plot_bicoherence(freqx, freqy, bicoh, mask)
-    plot_bicoherence(freqx, freqy, np.angle(bispec, deg=True), None,
-                     c_map="twilight_shifted")
-    plot_bicoherence(freqx, freqy, threshold)
-    #plot_bicoherence(freqx, freqy, np.imag(bispec))
-    #plot_bicoherence(threshold, freq)
+    if False:
+        f_20, b2s_20 = bicoh_slice(freqx, bicoh, 19.8)#bicoh_summed(sig, fs, int(0.5*fs), region = Region.A)
+        f_40, b2s_40 = bicoh_slice(freqx, bicoh, 39.8)
+        f_58, b2s_58 = bicoh_slice(freqx, bicoh, 58.8)
+        f_th, b2s_th = bicoh_slice(freqx, threshold, 19.8)
 
-    
-    #f, b2s = bicoh_slice(sig, fs, 19.8, int(0.5*fs))#bicoh_summed(sig, fs, int(0.5*fs), region = Region.A)
-    #plt.figure()
-    #plt.plot(f, b2s)
-    #plt.ylabel(r"$b^2_{\Sigma}$")
-    #plt.xlabel(r"$f, kHz$")
-    #plt.show()
+        fontsize = 24
+        plt.rcParams.update({'font.size': fontsize})
+        plt.figure()
+        plt.plot(f_20, b2s_20, label=r"$f_\ast = 20\ kHz$")
+        plt.plot(f_40, b2s_40, label=r"$f_\ast = 40\ kHz$")
+        plt.plot(f_th, b2s_th, label=r"$Threshold$")
+        plt.ylabel(r"$b^2(f, f_\ast)$")
+        plt.xlabel(r"$f, kHz$")
+        plt.legend(fontsize=18, borderpad=0.8, borderaxespad=1.0, labelspacing=0.6,handleheight=1.6)    
+        plt.grid(alpha=0.5)
+        plt.show()
+    else:
+        f_m, b2s_m, b2s_m_thresholded = bicoh_summed(sig, fs, int(1*fs), noverlap=int(0.5*fs),  region = Region.AB, threshold = threshold)
+        plt.figure()
+        plt.plot(f_m, b2s_m)
+        if b2s_m_thresholded is not None:
+            plt.plot(f_m, b2s_m_thresholded, label="Threshold", color="red")
+        plt.ylabel(r"$b_\Sigma^2(f)$")
+        plt.xlabel(r"$f, kHz$")
+        plt.grid(alpha=0.5)
+        plt.show()
